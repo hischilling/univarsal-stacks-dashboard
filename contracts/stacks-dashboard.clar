@@ -565,3 +565,390 @@
 
 ;; public functions
 ;;
+
+;; Contract management functions
+(define-public (set-contract-active (active bool))
+    (begin
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (var-set contract-active active)
+        (ok active))
+)
+
+(define-public (upgrade-contract (new-version uint))
+    (begin
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (asserts! (> new-version (var-get dashboard-version)) ERR_INVALID_INPUT)
+        (var-set dashboard-version new-version)
+        (ok new-version))
+)
+
+;; Address tracking and management
+(define-public (track-address (address principal) (tag (string-ascii 20)))
+    (begin
+        (asserts! (is-contract-active) ERR_OPERATION_FAILED)
+        (asserts! (not (is-eq address tx-sender)) ERR_INVALID_PRINCIPAL)
+        (asserts! (< (var-get total-tracked-addresses) MAX_TRACKED_ADDRESSES) ERR_OPERATION_FAILED)
+        (asserts! (> (len tag) u0) ERR_INVALID_INPUT)
+        
+        (let ((current-balance (stx-get-balance address))
+              (is-whale (>= current-balance WHALE_THRESHOLD)))
+            
+            (map-set address-info address
+                {
+                    balance: current-balance,
+                    last-activity-block: block-height,
+                    transaction-count: u0,
+                    stx-sent: u0,
+                    stx-received: u0,
+                    tag: tag,
+                    is-whale: is-whale,
+                    stacking-status: false,
+                    first-seen-block: block-height
+                })
+            
+            (var-set total-tracked-addresses (+ (var-get total-tracked-addresses) u1))
+            (ok address)))
+)
+
+(define-public (update-address-info (address principal))
+    (begin
+        (asserts! (is-contract-active) ERR_OPERATION_FAILED)
+        (asserts! (check-rate-limit tx-sender) ERR_OPERATION_FAILED)
+        (asserts! (not (is-eq address tx-sender)) ERR_INVALID_PRINCIPAL)
+        
+        (match (map-get? address-info address)
+            existing-info
+            (let ((current-balance (stx-get-balance address))
+                  (is-whale (>= current-balance WHALE_THRESHOLD)))
+                
+                (map-set address-info address
+                    (merge existing-info
+                        {
+                            balance: current-balance,
+                            last-activity-block: block-height,
+                            is-whale: is-whale,
+                            stacking-status: false
+                        }))
+                
+                (increment-api-usage tx-sender)
+                (ok address))
+            ERR_NOT_FOUND))
+)
+
+;; Address classification and tagging
+(define-public (set-address-tag (address principal) (primary-tag (string-ascii 20)) (secondary-tags (list 5 (string-ascii 20))))
+    (begin
+        (asserts! (is-contract-active) ERR_OPERATION_FAILED)
+        (asserts! (or (is-contract-owner) (is-eq tx-sender address)) ERR_UNAUTHORIZED)
+        (asserts! (> (len primary-tag) u0) ERR_INVALID_INPUT)
+        (asserts! (<= (len secondary-tags) u5) ERR_INVALID_INPUT)
+        
+        (map-set address-tags address
+            {
+                primary-tag: primary-tag,
+                secondary-tags: secondary-tags,
+                confidence-score: u100,
+                last-updated: block-height,
+                verified: (is-contract-owner)
+            })
+        
+        (ok address))
+)
+
+;; Transaction tracking
+(define-public (record-transaction (address principal) (tx-type (string-ascii 20)) (amount uint) (counterparty (optional principal)) (fee uint))
+    (begin
+        (asserts! (is-contract-active) ERR_OPERATION_FAILED)
+        (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
+        (asserts! (> (len tx-type) u0) ERR_INVALID_INPUT)
+        (asserts! (validate-amount fee) ERR_INVALID_AMOUNT)
+        
+        (match (map-get? address-info address)
+            existing-info
+            (let ((tx-count (get transaction-count existing-info))
+                  (new-tx-index (+ tx-count u1)))
+                
+                ;; Update transaction history
+                (map-set transaction-history
+                    { address: address, tx-index: new-tx-index }
+                    {
+                        block-height: block-height,
+                        tx-type: tx-type,
+                        amount: amount,
+                        counterparty: counterparty,
+                        timestamp: (unwrap-panic (get-block-info? time block-height)),
+                        fee-paid: fee
+                    })
+                
+                ;; Update address info
+                (map-set address-info address
+                    (merge existing-info
+                        {
+                            transaction-count: new-tx-index,
+                            last-activity-block: block-height,
+                            stx-sent: (if (is-eq tx-type "send")
+                                        (+ (get stx-sent existing-info) amount)
+                                        (get stx-sent existing-info)),
+                            stx-received: (if (is-eq tx-type "receive")
+                                           (+ (get stx-received existing-info) amount)
+                                           (get stx-received existing-info))
+                        }))
+                
+                ;; Generate whale alert if necessary  
+                (let ((should-alert (and (>= amount WHALE_THRESHOLD) (var-get whale-tracking-enabled))))
+                    (if should-alert
+                        (unwrap-panic (generate-whale-alert address amount tx-type))
+                        u0))
+                
+                (ok new-tx-index))
+            ERR_NOT_FOUND))
+)
+
+;; Whale alert system
+(define-public (generate-whale-alert (address principal) (amount uint) (alert-type (string-ascii 20)))
+    (begin
+        (asserts! (is-contract-active) ERR_OPERATION_FAILED)
+        (asserts! (var-get whale-tracking-enabled) ERR_OPERATION_FAILED)
+        (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
+        (asserts! (> (len alert-type) u0) ERR_INVALID_INPUT)
+        
+        (let ((alert-id (var-get next-alert-id))
+              (severity (if (>= amount (* WHALE_THRESHOLD u10)) u5
+                           (if (>= amount (* WHALE_THRESHOLD u5)) u4
+                              (if (>= amount (* WHALE_THRESHOLD u2)) u3
+                                 (if (>= amount WHALE_THRESHOLD) u2 u1))))))
+            
+            (map-set whale-alerts alert-id
+                {
+                    address: address,
+                    alert-type: alert-type,
+                    amount: amount,
+                    block-height: block-height,
+                    description: "Large STX movement detected",
+                    severity: severity
+                })
+            
+            (var-set next-alert-id (+ alert-id u1))
+            (var-set total-whale-alerts (+ (var-get total-whale-alerts) u1))
+            (ok alert-id)))
+)
+
+;; Stacking tracking
+(define-public (update-stacking-info (address principal) (stacked-amount uint) (pox-address (optional { version: (buff 1), hashbytes: (buff 32) })))
+    (begin
+        (asserts! (is-contract-active) ERR_OPERATION_FAILED)
+        (asserts! (>= stacked-amount MIN_STACKING_AMOUNT) ERR_INVALID_AMOUNT)
+        (asserts! (not (is-eq address tx-sender)) ERR_INVALID_PRINCIPAL)
+        
+        (let ((current-cycle (get-current-cycle)))
+            (match (map-get? stacking-info address)
+                existing-info
+                (map-set stacking-info address
+                    (merge existing-info
+                        {
+                            stacked-amount: stacked-amount,
+                            cycle-start: current-cycle,
+                            cycles-participated: (+ (get cycles-participated existing-info) u1),
+                            current-cycle-active: true,
+                            pox-address: pox-address
+                        }))
+                ;; New stacker
+                (map-set stacking-info address
+                    {
+                        stacked-amount: stacked-amount,
+                        cycle-start: current-cycle,
+                        cycles-participated: u1,
+                        total-rewards-earned: u0,
+                        current-cycle-active: true,
+                        pox-address: pox-address
+                    }))
+            
+            (ok address)))
+)
+
+;; Network metrics and analytics
+(define-public (update-network-metrics (total-supply uint) (circulating-supply uint) (stacked-supply uint) (active-addresses uint))
+    (begin
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (asserts! (is-contract-active) ERR_OPERATION_FAILED)
+        (asserts! (> total-supply u0) ERR_INVALID_INPUT)
+        (asserts! (<= circulating-supply total-supply) ERR_INVALID_INPUT)
+        (asserts! (<= stacked-supply total-supply) ERR_INVALID_INPUT)
+        
+        (map-set network-metrics block-height
+            {
+                total-stx-supply: total-supply,
+                circulating-supply: circulating-supply,
+                stacked-supply: stacked-supply,
+                active-addresses: active-addresses,
+                transaction-volume: u0, ;; Would be calculated from recent transactions
+                average-tx-fee: DEFAULT_TX_FEE,
+                whale-activity: (calculate-network-activity-score)
+            })
+        
+        (var-set last-update-block block-height)
+        (ok block-height))
+)
+
+;; Top holders management
+(define-public (update-top-holder (rank uint) (address principal) (balance uint) (percentage uint))
+    (begin
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (asserts! (<= rank TOP_HOLDERS_COUNT) ERR_INVALID_INPUT)
+        (asserts! (> balance u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= percentage u10000) ERR_INVALID_INPUT) ;; Max 100% (in basis points)
+        
+        (map-set top-holders rank
+            {
+                address: address,
+                balance: balance,
+                percentage-of-supply: percentage,
+                last-updated: block-height
+            })
+        
+        (ok rank))
+)
+
+;; Data retrieval functions
+(define-read-only (get-address-info (address principal))
+    (map-get? address-info address)
+)
+
+(define-read-only (get-address-tags (address principal))
+    (map-get? address-tags address)
+)
+
+(define-read-only (get-transaction-history (address principal) (tx-index uint))
+    (map-get? transaction-history { address: address, tx-index: tx-index })
+)
+
+(define-read-only (get-stacking-info (address principal))
+    (map-get? stacking-info address)
+)
+
+(define-read-only (get-network-metrics (block-height-param uint))
+    (map-get? network-metrics block-height-param)
+)
+
+(define-read-only (get-top-holder (rank uint))
+    (map-get? top-holders rank)
+)
+
+(define-read-only (get-whale-alert (alert-id uint))
+    (map-get? whale-alerts alert-id)
+)
+
+;; Analytics and reporting functions
+(define-read-only (get-balance-distribution (bucket-name (string-ascii 20)))
+    (map-get? balance-distribution bucket-name)
+)
+
+(define-read-only (get-time-series-data (metric-type (string-ascii 30)) (time-period uint))
+    (map-get? time-series-data { metric-type: metric-type, time-period: time-period })
+)
+
+(define-read-only (get-address-relationships (from-address principal) (to-address principal))
+    (map-get? address-relationships { from-address: from-address, to-address: to-address })
+)
+
+;; Dashboard utilities
+(define-read-only (get-dashboard-stats)
+    {
+        total-tracked-addresses: (var-get total-tracked-addresses),
+        last-update-block: (var-get last-update-block),
+        dashboard-version: (var-get dashboard-version),
+        analytics-enabled: (var-get analytics-enabled),
+        whale-tracking-enabled: (var-get whale-tracking-enabled),
+        total-whale-alerts: (var-get total-whale-alerts),
+        contract-active: (var-get contract-active)
+    }
+)
+
+(define-read-only (get-address-classification (address principal))
+    (let ((balance (stx-get-balance address)))
+        {
+            balance: balance,
+            balance-stx: (/ balance MICROSTX_PER_STX),
+            classification: (if (>= balance WHALE_THRESHOLD) WHALE_THRESHOLD
+                               (if (>= balance LARGE_HOLDER_THRESHOLD) LARGE_HOLDER_THRESHOLD
+                                  (if (>= balance MEDIUM_HOLDER_THRESHOLD) MEDIUM_HOLDER_THRESHOLD u0))),
+            is-whale: (>= balance WHALE_THRESHOLD),
+            is-stacking: false, ;; Simplified for read-only
+            transaction-velocity: u0, ;; Simplified for read-only
+            net-flow: u0 ;; Simplified for read-only
+        })
+)
+
+;; User preferences and configuration
+(define-public (set-user-preferences (default-timeframe uint) (notification-threshold uint) (tracked-addresses (list 20 principal)))
+    (begin
+        (asserts! (is-contract-active) ERR_OPERATION_FAILED)
+        (asserts! (<= (len tracked-addresses) u20) ERR_INVALID_INPUT)
+        (asserts! (> default-timeframe u0) ERR_INVALID_INPUT)
+        (asserts! (validate-amount notification-threshold) ERR_INVALID_AMOUNT)
+        
+        (map-set user-preferences tx-sender
+            {
+                default-timeframe: default-timeframe,
+                notification-threshold: notification-threshold,
+                tracked-addresses: tracked-addresses,
+                access-level: u1,
+                last-login: block-height
+            })
+        
+        (ok tx-sender))
+)
+
+(define-read-only (get-user-preferences (user principal))
+    (map-get? user-preferences user)
+)
+
+;; Historical data snapshots
+(define-public (create-snapshot (snapshot-type (string-ascii 20)))
+    (begin
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (asserts! (> (len snapshot-type) u0) ERR_INVALID_INPUT)
+        
+        (let ((snapshot-id (var-get next-snapshot-id)))
+            (map-set historical-snapshots snapshot-id
+                {
+                    block-height: block-height,
+                    total-addresses: (var-get total-tracked-addresses),
+                    total-supply: u0, ;; Would be fetched from network
+                    stacking-participation: u0, ;; Would be calculated
+                    network-activity: (calculate-network-activity-score),
+                    snapshot-type: snapshot-type
+                })
+            
+            (var-set next-snapshot-id (+ snapshot-id u1))
+            (ok snapshot-id)))
+)
+
+(define-read-only (get-snapshot (snapshot-id uint))
+    (map-get? historical-snapshots snapshot-id)
+)
+
+;; Cache management
+(define-public (clear-cache (cache-key (string-ascii 50)))
+    (begin
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (asserts! (> (len cache-key) u0) ERR_INVALID_INPUT)
+        (map-delete analytics-cache cache-key)
+        (ok cache-key))
+)
+
+;; Maintenance functions
+(define-public (cleanup-old-data-public)
+    (begin
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (cleanup-old-data))
+)
+
+(define-public (set-feature-flags (whale-tracking bool) (real-time-updates bool) (analytics bool))
+    (begin
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (var-set whale-tracking-enabled whale-tracking)
+        (var-set real-time-updates-enabled real-time-updates)
+        (var-set analytics-enabled analytics)
+        (ok true))
+)
