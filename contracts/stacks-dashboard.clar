@@ -84,6 +84,224 @@
 ;; data maps and vars
 ;;
 
+;; Global state variables
+(define-data-var contract-active bool true)
+(define-data-var total-tracked-addresses uint u0)
+(define-data-var last-update-block uint u0)
+(define-data-var dashboard-version uint u1)
+(define-data-var analytics-enabled bool true)
+
+;; Address tracking and classification
+(define-map address-info 
+    principal 
+    {
+        balance: uint,
+        last-activity-block: uint,
+        transaction-count: uint,
+        stx-sent: uint,
+        stx-received: uint,
+        tag: (string-ascii 20),
+        is-whale: bool,
+        stacking-status: bool,
+        first-seen-block: uint
+    }
+)
+
+;; Transaction history tracking
+(define-map transaction-history
+    { address: principal, tx-index: uint }
+    {
+        block-height: uint,
+        tx-type: (string-ascii 20),
+        amount: uint,
+        counterparty: (optional principal),
+        timestamp: uint,
+        fee-paid: uint
+    }
+)
+
+;; Address classification and tagging
+(define-map address-tags
+    principal
+    {
+        primary-tag: (string-ascii 20),
+        secondary-tags: (list 5 (string-ascii 20)),
+        confidence-score: uint,
+        last-updated: uint,
+        verified: bool
+    }
+)
+
+;; Stacking participation tracking
+(define-map stacking-info
+    principal
+    {
+        stacked-amount: uint,
+        cycle-start: uint,
+        cycles-participated: uint,
+        total-rewards-earned: uint,
+        current-cycle-active: bool,
+        pox-address: (optional { version: (buff 1), hashbytes: (buff 32) })
+    }
+)
+
+;; Network statistics and metrics
+(define-map network-metrics
+    uint ;; block-height
+    {
+        total-stx-supply: uint,
+        circulating-supply: uint,
+        stacked-supply: uint,
+        active-addresses: uint,
+        transaction-volume: uint,
+        average-tx-fee: uint,
+        whale-activity: uint
+    }
+)
+
+;; Top holders tracking
+(define-map top-holders
+    uint ;; rank (1-100)
+    {
+        address: principal,
+        balance: uint,
+        percentage-of-supply: uint,
+        last-updated: uint
+    }
+)
+
+;; Analytics cache for performance
+(define-map analytics-cache
+    (string-ascii 50) ;; cache-key
+    {
+        data: (string-ascii 1024),
+        last-updated: uint,
+        expiry-block: uint,
+        hit-count: uint
+    }
+)
+
+;; Balance distribution buckets
+(define-map balance-distribution
+    (string-ascii 20) ;; bucket-name (e.g., "0-1k", "1k-10k", etc.)
+    {
+        min-balance: uint,
+        max-balance: uint,
+        address-count: uint,
+        total-balance: uint,
+        percentage: uint
+    }
+)
+
+;; Daily/Weekly/Monthly aggregates
+(define-map time-series-data
+    { metric-type: (string-ascii 30), time-period: uint }
+    {
+        value: uint,
+        timestamp: uint,
+        block-height: uint,
+        change-from-previous: int
+    }
+)
+
+;; Address relationship tracking (for flow analysis)
+(define-map address-relationships
+    { from-address: principal, to-address: principal }
+    {
+        total-transfers: uint,
+        total-amount: uint,
+        first-interaction: uint,
+        last-interaction: uint,
+        relationship-strength: uint
+    }
+)
+
+;; Contract interaction tracking
+(define-map contract-interactions
+    { user: principal, contract: principal }
+    {
+        interaction-count: uint,
+        total-value: uint,
+        first-interaction: uint,
+        last-interaction: uint,
+        function-calls: (list 10 (string-ascii 30))
+    }
+)
+
+;; Whale alert system
+(define-map whale-alerts
+    uint ;; alert-id
+    {
+        address: principal,
+        alert-type: (string-ascii 20),
+        amount: uint,
+        block-height: uint,
+        description: (string-ascii 100),
+        severity: uint
+    }
+)
+
+;; Dashboard user preferences and access control
+(define-map user-preferences
+    principal
+    {
+        default-timeframe: uint,
+        notification-threshold: uint,
+        tracked-addresses: (list 20 principal),
+        access-level: uint,
+        last-login: uint
+    }
+)
+
+;; API rate limiting and usage tracking
+(define-map api-usage
+    principal
+    {
+        requests-today: uint,
+        last-request-block: uint,
+        total-requests: uint,
+        subscription-tier: uint,
+        rate-limit: uint
+    }
+)
+
+;; Market data and price tracking (if needed for analysis)
+(define-map market-data
+    uint ;; block-height
+    {
+        stx-price-usd: uint, ;; Price in cents (e.g., 150 = $1.50)
+        market-cap: uint,
+        trading-volume-24h: uint,
+        price-change-24h: int,
+        last-updated: uint
+    }
+)
+
+;; Historical snapshots for trend analysis
+(define-map historical-snapshots
+    uint ;; snapshot-id
+    {
+        block-height: uint,
+        total-addresses: uint,
+        total-supply: uint,
+        stacking-participation: uint,
+        network-activity: uint,
+        snapshot-type: (string-ascii 20)
+    }
+)
+
+;; Counter variables for various metrics
+(define-data-var next-alert-id uint u1)
+(define-data-var next-snapshot-id uint u1)
+(define-data-var total-whale-alerts uint u0)
+(define-data-var total-api-requests uint u0)
+
+;; Feature flags and configuration
+(define-data-var whale-tracking-enabled bool true)
+(define-data-var real-time-updates-enabled bool true)
+(define-data-var historical-data-retention-blocks uint u52560) ;; 1 year
+(define-data-var max-cached-entries uint u1000)
+
 ;; private functions
 ;;
 
